@@ -1,7 +1,9 @@
 #define PY_SSIZE_T_CLEAN
 #include "Python.h"
 
+#include "docstring.h"
 #include "hiwire.h"
+#include "js2python.h"
 #include "jsproxy.h"
 #include "pyproxy.h"
 #include "python2js.h"
@@ -9,95 +11,24 @@
 
 #include "python2js_buffer.h"
 
-static PyObject* tbmod = NULL;
-
 static JsRef
 _python2js_unicode(PyObject* x);
 
-void
-pythonexc2js()
-{
-  PyObject* type;
-  PyObject* value;
-  PyObject* traceback;
-  int no_traceback = 0;
-
-  PyErr_Fetch(&type, &value, &traceback);
-  PyErr_NormalizeException(&type, &value, &traceback);
-
-  JsRef excval = NULL;
-  int exc;
-
-  if (type == NULL || type == Py_None || value == NULL || value == Py_None) {
-    excval = hiwire_string_ascii("No exception type or value");
-    PyErr_Print();
-    PyErr_Clear();
-    goto exit;
-  }
-
-  if (tbmod == NULL) {
-    tbmod = PyImport_ImportModule("traceback");
-    if (tbmod == NULL) {
-      PyObject* repr = PyObject_Repr(value);
-      if (repr == NULL) {
-        excval = hiwire_string_ascii("Could not get repr for exception");
-      } else {
-        excval = _python2js_unicode(repr);
-        Py_DECREF(repr);
-      }
-      goto exit;
-    }
-  }
-
-  PyObject* format_exception;
-  if (traceback == NULL || traceback == Py_None) {
-    no_traceback = 1;
-    format_exception = PyObject_GetAttrString(tbmod, "format_exception_only");
-  } else {
-    format_exception = PyObject_GetAttrString(tbmod, "format_exception");
-  }
-  if (format_exception == NULL) {
-    excval = hiwire_string_ascii("Could not get format_exception function");
-  } else {
-    PyObject* pylines;
-    if (no_traceback) {
-      pylines =
-        PyObject_CallFunctionObjArgs(format_exception, type, value, NULL);
-    } else {
-      pylines = PyObject_CallFunctionObjArgs(
-        format_exception, type, value, traceback, NULL);
-    }
-    if (pylines == NULL) {
-      excval = hiwire_string_ascii("Error calling traceback.format_exception");
-      PyErr_Print();
-      PyErr_Clear();
-      goto exit;
-    } else {
-      PyObject* empty = PyUnicode_FromString("");
-      PyObject* pystr = PyUnicode_Join(empty, pylines);
-      printf("Python exception:\n");
-      printf("%s\n", PyUnicode_AsUTF8(pystr));
-      excval = _python2js_unicode(pystr);
-      Py_DECREF(pystr);
-      Py_DECREF(empty);
-      Py_DECREF(pylines);
-    }
-    Py_DECREF(format_exception);
-  }
-
-exit:
-  PyErr_Clear();
-  hiwire_throw_error(excval);
-}
+static inline JsRef
+_python2js_immutable(PyObject* x);
 
 int
-_python2js_add_to_cache(PyObject* map, PyObject* pyparent, JsRef jsparent);
-
-int
-_python2js_remove_from_cache(PyObject* map, PyObject* pyparent);
+_python2js_add_to_cache(PyObject* cache, PyObject* pyparent, JsRef jsparent);
 
 JsRef
-_python2js_cache(PyObject* x, PyObject* map);
+_python2js(PyObject* x, PyObject* cache, int depth, JsRef proxies);
+
+///////////////////////////////////////////////////////////////////////////////
+//
+// Simple Converters
+//
+// These convert float, int, and unicode types. Used by python2js_immutable
+// (which also handles bool and None).
 
 static JsRef
 _python2js_float(PyObject* x)
@@ -116,16 +47,22 @@ _python2js_long(PyObject* x)
   long x_long = PyLong_AsLongAndOverflow(x, &overflow);
   if (x_long == -1) {
     if (overflow) {
-      PyObject* py_float = PyNumber_Float(x);
-      if (py_float == NULL) {
-        return NULL;
-      }
-      return _python2js_float(py_float);
-    } else if (PyErr_Occurred()) {
-      return NULL;
+      // Backup approach for large integers: convert via hex string.
+      //
+      // Unfortunately Javascript doesn't offer a good way to convert a numbers
+      // to / from Uint8Arrays.
+      PyObject* hex_py = PyNumber_ToBase(x, 16);
+      FAIL_IF_NULL(hex_py);
+      const char* hex_str = PyUnicode_AsUTF8(hex_py);
+      JsRef result = hiwire_int_from_hex(hex_str);
+      Py_DECREF(hex_py);
+      return result;
     }
+    FAIL_IF_ERR_OCCURRED();
   }
   return hiwire_int(x_long);
+finally:
+  return NULL;
 }
 
 static JsRef
@@ -147,142 +84,242 @@ _python2js_unicode(PyObject* x)
   }
 }
 
-static JsRef
-_python2js_bytes(PyObject* x)
-{
-  char* x_buff;
-  Py_ssize_t length;
-  if (PyBytes_AsStringAndSize(x, &x_buff, &length)) {
-    return NULL;
-  }
-  return hiwire_bytes(x_buff, length);
-}
+///////////////////////////////////////////////////////////////////////////////
+//
+// Container Converters
+//
+// These convert list, dict, and set types. We only convert objects that
+// subclass list, dict, or set.
+//
+// One might consider trying to convert things that satisfy PyMapping_Check to
+// maps and things that satisfy PySequence_Check to lists. However
+// PyMapping_Check "returns 1 for Python classes with a __getitem__() method"
+// and PySequence_Check returns 1 for classes with a __getitem__ method that
+// don't subclass dict. For this reason, I think we should stick to subclasses.
 
+/**
+ * WARNING: This function is not suitable for fallbacks. If this function
+ * returns NULL, we must assume that the cache has been corrupted and bail out.
+ */
 static JsRef
-_python2js_sequence(PyObject* x, PyObject* map)
+_python2js_sequence(PyObject* x, PyObject* cache, int depth, JsRef proxies)
 {
-  JsRef jsarray = hiwire_array();
-  if (_python2js_add_to_cache(map, x, jsarray)) {
-    hiwire_decref(jsarray);
-    return NULL;
-  }
-  size_t length = PySequence_Size(x);
-  for (size_t i = 0; i < length; ++i) {
+  bool success = false;
+  PyObject* pyitem = NULL;
+  JsRef jsitem = NULL;
+  // result:
+  JsRef jsarray = NULL;
+
+  jsarray = JsArray_New();
+  FAIL_IF_MINUS_ONE(_python2js_add_to_cache(cache, x, jsarray));
+  Py_ssize_t length = PySequence_Size(x);
+  FAIL_IF_MINUS_ONE(length);
+  for (Py_ssize_t i = 0; i < length; ++i) {
     PyObject* pyitem = PySequence_GetItem(x, i);
-    if (pyitem == NULL) {
-      // If something goes wrong converting the sequence (as is the case with
-      // Pandas data frames), fallback to the Python object proxy
-      _python2js_remove_from_cache(map, x);
-      hiwire_decref(jsarray);
-      PyErr_Clear();
-      Py_INCREF(x);
-      return pyproxy_new(x);
-    }
-    JsRef jsitem = _python2js_cache(pyitem, map);
-    if (jsitem == NULL) {
-      _python2js_remove_from_cache(map, x);
-      Py_DECREF(pyitem);
-      hiwire_decref(jsarray);
-      return NULL;
-    }
-    Py_DECREF(pyitem);
-    hiwire_push_array(jsarray, jsitem);
-    hiwire_decref(jsitem);
+    FAIL_IF_NULL(pyitem);
+    jsitem = _python2js(pyitem, cache, depth, proxies);
+    FAIL_IF_NULL(jsitem);
+    JsArray_Push(jsarray, jsitem);
+    Py_CLEAR(pyitem);
+    hiwire_CLEAR(jsitem);
   }
-  if (_python2js_remove_from_cache(map, x)) {
-    hiwire_decref(jsarray);
-    return NULL;
+  success = true;
+finally:
+  Py_CLEAR(pyitem);
+  hiwire_CLEAR(jsitem);
+  if (!success) {
+    hiwire_CLEAR(jsarray);
   }
   return jsarray;
 }
 
+/**
+ * WARNING: This function is not suitable for fallbacks. If this function
+ * returns NULL, we must assume that the cache has been corrupted and bail out.
+ */
 static JsRef
-_python2js_dict(PyObject* x, PyObject* map)
+_python2js_dict(PyObject* x, PyObject* cache, int depth, JsRef proxies)
 {
-  JsRef jsdict = hiwire_object();
-  if (_python2js_add_to_cache(map, x, jsdict)) {
-    hiwire_decref(jsdict);
-    return NULL;
-  }
+  bool success = false;
+  JsRef jskey = NULL;
+  JsRef jsval = NULL;
+  // result:
+  JsRef jsdict = NULL;
+
+  jsdict = JsMap_New();
+  FAIL_IF_MINUS_ONE(_python2js_add_to_cache(cache, x, jsdict));
   PyObject *pykey, *pyval;
   Py_ssize_t pos = 0;
   while (PyDict_Next(x, &pos, &pykey, &pyval)) {
-    JsRef jskey = _python2js_cache(pykey, map);
+    jskey = _python2js_immutable(pykey);
     if (jskey == NULL) {
-      _python2js_remove_from_cache(map, x);
-      hiwire_decref(jsdict);
-      return NULL;
+      FAIL_IF_ERR_OCCURRED();
+      PyErr_Format(
+        conversion_error, "Cannot use %R as a key for a Javascript Map", pykey);
+      FAIL();
     }
-    JsRef jsval = _python2js_cache(pyval, map);
-    if (jsval == NULL) {
-      _python2js_remove_from_cache(map, x);
-      hiwire_decref(jskey);
-      hiwire_decref(jsdict);
-      return NULL;
-    }
-    hiwire_push_object_pair(jsdict, jskey, jsval);
-    hiwire_decref(jskey);
-    hiwire_decref(jsval);
+    jsval = _python2js(pyval, cache, depth, proxies);
+    FAIL_IF_NULL(jsval);
+    FAIL_IF_MINUS_ONE(JsMap_Set(jsdict, jskey, jsval));
+    hiwire_CLEAR(jskey);
+    hiwire_CLEAR(jsval);
   }
-  if (_python2js_remove_from_cache(map, x)) {
-    hiwire_decref(jsdict);
-    return NULL;
+  success = true;
+finally:
+  hiwire_CLEAR(jskey);
+  hiwire_CLEAR(jsval);
+  if (!success) {
+    hiwire_CLEAR(jsdict);
   }
   return jsdict;
 }
 
+/**
+ * Note that this is not really a deep conversion because we refuse to convert
+ * sets that contain e.g., tuples. This will only succeed if the sets only
+ * contain basic types. This is a bit restrictive, but hopefully will be useful
+ * anyways.
+ *
+ * This function can be used with fallbacks but currently isn't (we
+ * just abort the entire conversion and throw an error if we encounter a set we
+ * can't convert).
+ */
 static JsRef
-_python2js(PyObject* x, PyObject* map)
+_python2js_set(PyObject* x, PyObject* cache, int depth)
+{
+  bool success = false;
+  PyObject* iter = NULL;
+  PyObject* pykey = NULL;
+  JsRef jskey = NULL;
+  // result:
+  JsRef jsset = NULL;
+
+  jsset = JsSet_New();
+  iter = PyObject_GetIter(x);
+  FAIL_IF_NULL(iter);
+  while ((pykey = PyIter_Next(iter))) {
+    jskey = _python2js_immutable(pykey);
+    if (jskey == NULL) {
+      FAIL_IF_ERR_OCCURRED();
+      PyErr_Format(
+        conversion_error, "Cannot use %R as a key for a Javascript set", pykey);
+      FAIL();
+    }
+    FAIL_IF_MINUS_ONE(JsSet_Add(jsset, jskey));
+    Py_CLEAR(pykey);
+    hiwire_CLEAR(jskey);
+  }
+  FAIL_IF_ERR_OCCURRED();
+  // Because we only convert immutable keys, we can do this here.
+  // Otherwise, we'd fail on the set that contains itself.
+  FAIL_IF_MINUS_ONE(_python2js_add_to_cache(cache, x, jsset));
+  success = true;
+finally:
+  Py_CLEAR(pykey);
+  hiwire_CLEAR(jskey);
+  if (!success) {
+    hiwire_CLEAR(jsset);
+  }
+  return jsset;
+}
+
+/**
+ * if x is NULL, fail
+ * if x is Js_novalue, do nothing
+ * in any other case, return x
+ */
+#define RETURN_IF_HAS_VALUE(x)                                                 \
+  do {                                                                         \
+    JsRef _fresh_result = x;                                                   \
+    FAIL_IF_NULL(_fresh_result);                                               \
+    if (_fresh_result != Js_novalue) {                                         \
+      return _fresh_result;                                                    \
+    }                                                                          \
+  } while (0)
+
+/**
+ * Convert x if x is an immutable python type for which there exists an
+ * equivalent immutable Javascript type. Otherwise return Js_novalue.
+ *
+ * Return type would be Option<JsRef>
+ */
+static inline JsRef
+_python2js_immutable(PyObject* x)
 {
   if (x == Py_None) {
-    return hiwire_undefined();
+    return Js_undefined;
   } else if (x == Py_True) {
-    return hiwire_true();
+    return Js_true;
   } else if (x == Py_False) {
-    return hiwire_false();
+    return Js_false;
   } else if (PyLong_Check(x)) {
     return _python2js_long(x);
   } else if (PyFloat_Check(x)) {
     return _python2js_float(x);
   } else if (PyUnicode_Check(x)) {
     return _python2js_unicode(x);
-  } else if (PyBytes_Check(x)) {
-    return _python2js_bytes(x);
-  } else if (JsProxy_Check(x)) {
+  }
+  return Js_novalue;
+}
+
+/**
+ * If x is a wrapper around a Javascript object, unwrap the Javascript object
+ * and return it. Otherwise, return Js_novalue.
+ *
+ * Return type would be Option<JsRef>
+ */
+static inline JsRef
+_python2js_proxy(PyObject* x)
+{
+  if (JsProxy_Check(x)) {
     return JsProxy_AsJs(x);
   } else if (JsException_Check(x)) {
     return JsException_AsJs(x);
-  } else if (PyList_Check(x) || PyTuple_Check(x)) {
-    return _python2js_sequence(x, map);
-  } else if (PyDict_Check(x)) {
-    return _python2js_dict(x, map);
-  } else {
-    JsRef ret = _python2js_buffer(x);
-
-    if (ret != NULL) {
-      return ret;
-    }
-    if (PySequence_Check(x)) {
-      return _python2js_sequence(x, map);
-    }
-
-    // Proxies we've already created are just returned again, so that the
-    // same object on the Python side is always the same object on the
-    // Javascript side.
-    ret = pyproxy_use(x);
-    if (ret != NULL) {
-      return ret;
-    }
-
-    // Reference counter is increased only once when a PyProxy is created.
-    Py_INCREF(x);
-    return pyproxy_new(x);
   }
+  return Js_novalue;
+}
+
+/**
+ * This function is a helper function for _python2js which handles the case when
+ * we want to convert at least the outermost layer.
+ */
+static JsRef
+_python2js_deep(PyObject* x, PyObject* cache, int depth, JsRef proxies)
+{
+  RETURN_IF_HAS_VALUE(_python2js_immutable(x));
+  RETURN_IF_HAS_VALUE(_python2js_proxy(x));
+  if (PyList_Check(x) || PyTuple_Check(x)) {
+    return _python2js_sequence(x, cache, depth, proxies);
+  }
+  if (PyDict_Check(x)) {
+    return _python2js_dict(x, cache, depth, proxies);
+  }
+  if (PySet_Check(x)) {
+    return _python2js_set(x, cache, depth);
+  }
+  if (PyObject_CheckBuffer(x)) {
+    return _python2js_buffer(x);
+  }
+  if (proxies) {
+    JsRef proxy = pyproxy_new(x);
+    JsArray_Push(proxies, proxy);
+    return proxy;
+  }
+  PyErr_SetString(conversion_error, "No conversion known for x.");
+finally:
+  return NULL;
 }
 
 /* During conversion of collection types (lists and dicts) from Python to
  * Javascript, we need to make sure that those collections don't include
- * themselves, otherwise infinite recursion occurs.
+ * themselves, otherwise infinite recursion occurs. We also want to make sure
+ * that if the list contains multiple copies of the same list that they point to
+ * the same place. For after:
+ *
+ * a = list(range(10))
+ * b = [a, a, a, a]
+ *
+ * We want to ensure that b.toJs()[0] is the same list as b.toJs()[1].
  *
  * The solution is to maintain a cache mapping from the PyObject* to the
  * Javascript object id for all collection objects. (One could do this for
@@ -293,62 +330,200 @@ _python2js(PyObject* x, PyObject* map)
  */
 
 int
-_python2js_add_to_cache(PyObject* map, PyObject* pyparent, JsRef jsparent)
+_python2js_add_to_cache(PyObject* cache, PyObject* pyparent, JsRef jsparent)
 {
   /* Use the pointer converted to an int so cache is by identity, not hash */
-  PyObject* pyparentid = PyLong_FromSize_t((size_t)pyparent);
-  PyObject* jsparentid = PyLong_FromLong((int)jsparent);
-  int result = PyDict_SetItem(map, pyparentid, jsparentid);
-  Py_DECREF(pyparentid);
-  Py_DECREF(jsparentid);
+  int result = -1;
+  PyObject* pyparentid = NULL;
+  PyObject* jsparentid = NULL;
 
+  pyparentid = PyLong_FromSize_t((size_t)pyparent);
+  FAIL_IF_NULL(pyparentid);
+  jsparent = hiwire_incref(jsparent);
+  jsparentid = PyLong_FromSize_t((size_t)jsparent);
+  FAIL_IF_NULL(jsparentid);
+  result = PyDict_SetItem(cache, pyparentid, jsparentid);
+
+finally:
+  Py_CLEAR(pyparentid);
+  Py_CLEAR(jsparentid);
   return result;
 }
 
-int
-_python2js_remove_from_cache(PyObject* map, PyObject* pyparent)
-{
-  PyObject* pyparentid = PyLong_FromSize_t((size_t)pyparent);
-  int result = PyDict_DelItem(map, pyparentid);
-  Py_DECREF(pyparentid);
-
-  return result;
-}
-
+/**
+ * This is a helper for python2js_with_depth. We need to create a cache for the
+ * conversion, so we can't use the entry point as the root of the recursion.
+ * Instead python2js_with_depth makes a cache and then calls this helper.
+ *
+ * This checks if the object x is already in the cache and if so returns it from
+ * the cache. It leaves any real work to python2js or _python2js_deep.
+ */
 JsRef
-_python2js_cache(PyObject* x, PyObject* map)
+_python2js(PyObject* x, PyObject* cache, int depth, JsRef proxies)
 {
   PyObject* id = PyLong_FromSize_t((size_t)x);
-  PyObject* val = PyDict_GetItem(map, id);
-  JsRef result;
-  if (val) {
-    result = (JsRef)PyLong_AsLong(val);
-    if (result != NULL) {
-      result = hiwire_incref(result);
-    }
-  } else {
-    result = _python2js(x, map);
+  FAIL_IF_NULL(id);
+  PyObject* val = PyDict_GetItemWithError(cache, id); /* borrowed */
+  Py_CLEAR(id);
+  if (val != NULL) {
+    return hiwire_incref((JsRef)PyLong_AsSize_t(val));
   }
-  Py_DECREF(id);
-  return result;
+  FAIL_IF_ERR_OCCURRED();
+  if (depth == 0) {
+    return python2js_track_proxies(x, proxies);
+  } else {
+    return _python2js_deep(x, cache, depth - 1, proxies);
+  }
+finally:
+  return NULL;
 }
 
+/**
+ * Do a shallow conversion from python2js. Convert immutable types with
+ * equivalent Javascript immutable types, but all other types are proxied.
+ *
+ */
+JsRef
+python2js_inner(PyObject* x, JsRef proxies, bool track_proxies)
+{
+  RETURN_IF_HAS_VALUE(_python2js_immutable(x));
+  RETURN_IF_HAS_VALUE(_python2js_proxy(x));
+  if (track_proxies && proxies == NULL) {
+    PyErr_SetString(conversion_error, "No conversion known for x.");
+    FAIL();
+  }
+  JsRef proxy = pyproxy_new(x);
+  FAIL_IF_NULL(proxy);
+  if (track_proxies) {
+    JsArray_Push(proxies, proxy);
+  }
+  return proxy;
+finally:
+  if (PyErr_Occurred()) {
+    if (!PyErr_ExceptionMatches(conversion_error)) {
+      _PyErr_FormatFromCause(conversion_error,
+                             "Conversion from python to javascript failed");
+    }
+  } else {
+    PyErr_SetString(internal_error, "Internal error occurred in python2js");
+  }
+  return NULL;
+}
+
+/**
+ * Do a shallow conversion from python2js. Convert immutable types with
+ * equivalent Javascript immutable types.
+ *
+ * Other types are proxied and added to the list proxies (to allow easy memory
+ * management later). If proxies is NULL, python2js will raise an error instead
+ * of creating a proxy.
+ */
+JsRef
+python2js_track_proxies(PyObject* x, JsRef proxies)
+{
+  return python2js_inner(x, proxies, true);
+}
+
+/**
+ * Do a shallow conversion from python2js. Convert immutable types with
+ * equivalent Javascript immutable types, but all other types are proxied.
+ */
 JsRef
 python2js(PyObject* x)
 {
-  PyObject* map = PyDict_New();
-  JsRef result = _python2js_cache(x, map);
-  Py_DECREF(map);
+  return python2js_inner(x, NULL, false);
+}
 
-  if (result == NULL) {
-    pythonexc2js();
+/**
+ * Do a deep conversion from Python to Javascript, converting lists, dicts, and
+ * sets down to depth "depth".
+ */
+JsRef
+python2js_with_depth(PyObject* x, int depth, JsRef proxies)
+{
+  PyObject* cache = PyDict_New();
+  if (cache == NULL) {
+    return NULL;
   }
-
+  JsRef result = _python2js(x, cache, depth, proxies);
+  // Destroy the cache. Because the cache has raw JsRefs inside, we need to
+  // manually dealloc them.
+  PyObject *pykey, *pyval;
+  Py_ssize_t pos = 0;
+  while (PyDict_Next(cache, &pos, &pykey, &pyval)) {
+    JsRef obj = (JsRef)PyLong_AsSize_t(pyval);
+    hiwire_decref(obj);
+  }
+  Py_DECREF(cache);
+  if (result == NULL || result == Js_novalue) {
+    result = NULL;
+    if (PyErr_Occurred()) {
+      if (!PyErr_ExceptionMatches(conversion_error)) {
+        _PyErr_FormatFromCause(conversion_error,
+                               "Conversion from python to javascript failed");
+      }
+    } else {
+      PyErr_SetString(internal_error,
+                      "Internal error occurred in python2js_with_depth");
+    }
+  }
   return result;
 }
 
-int
-python2js_init()
+static PyObject*
+to_js(PyObject* _mod, PyObject* args)
 {
-  return 0;
+  PyObject* obj;
+  int depth = -1;
+  if (!PyArg_ParseTuple(args, "O|i:to_js", &obj, &depth)) {
+    return NULL;
+  }
+  if (obj == Py_None || PyBool_Check(obj) || PyLong_Check(obj) ||
+      PyFloat_Check(obj) || PyUnicode_Check(obj) || JsProxy_Check(obj) ||
+      JsException_Check(obj)) {
+    // No point in converting these and it'd be useless to proxy them since
+    // they'd just get converted back by `js2python` at the end
+    Py_INCREF(obj);
+    return obj;
+  }
+  JsRef proxies = NULL;
+  JsRef js_result = NULL;
+  PyObject* py_result = NULL;
+
+  proxies = JsArray_New();
+  js_result = python2js_with_depth(obj, depth, proxies);
+  FAIL_IF_NULL(js_result);
+  if (hiwire_is_pyproxy(js_result)) {
+    // Oops, just created a PyProxy. Wrap it I guess?
+    py_result = JsProxy_create(js_result);
+  } else {
+    py_result = js2python(js_result);
+  }
+finally:
+  hiwire_CLEAR(js_result);
+  hiwire_CLEAR(proxies);
+  return py_result;
+}
+
+static PyMethodDef methods[] = {
+  {
+    "to_js",
+    to_js,
+    METH_VARARGS,
+  },
+  { NULL } /* Sentinel */
+};
+
+int
+python2js_init(PyObject* core)
+{
+  bool success = false;
+  PyObject* docstring_source = PyImport_ImportModule("_pyodide._core");
+  FAIL_IF_NULL(docstring_source);
+  FAIL_IF_MINUS_ONE(
+    add_methods_and_set_docstrings(core, methods, docstring_source));
+  success = true;
+finally:
+  Py_CLEAR(docstring_source);
+  return success ? 0 : -1;
 }

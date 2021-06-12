@@ -15,14 +15,10 @@
  *  \return The Python object wrapping the Javascript object.
  */
 PyObject*
-JsProxy_cnew(JsRef v);
+JsProxy_create(JsRef v);
 
-/** Make a new JsProxy Error.
- *  \param v The Javascript error object.
- *  \return The Python error object wrapping the Javascript error object.
- */
 PyObject*
-JsProxy_new_error(JsRef v);
+JsProxy_create_with_this(JsRef object, JsRef this);
 
 /** Check if a Python object is a JsProxy object.
  *  \param x The Python object
@@ -37,6 +33,17 @@ JsProxy_Check(PyObject* x);
  */
 JsRef
 JsProxy_AsJs(PyObject* x);
+
+/**
+ * obj must be a JsProxy of a buffer (we do no checking!)
+ * Make a new Python Buffer object and copy the data from obj into
+ *
+ */
+PyObject*
+JsBuffer_CloneIntoPython(JsRef jsbuffer,
+                         Py_ssize_t byteLength,
+                         char* format,
+                         Py_ssize_t itemsize);
 
 /** Check if a Python object is a JsException object.
  *  \param x The Python object
@@ -54,6 +61,6 @@ JsException_AsJs(PyObject* x);
 
 /** Initialize global state for the JsProxy functionality. */
 int
-JsProxy_init();
+JsProxy_init(PyObject* core_module);
 
 #endif /* JSPROXY_H */

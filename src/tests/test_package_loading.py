@@ -24,7 +24,7 @@ def test_load_from_url(selenium_standalone, web_server_secondary, active_server)
         fh_backup.seek(0, 2)
 
         selenium_standalone.load_package(f"http://{url}:{port}/pyparsing.js")
-        assert "Invalid package name or URI" not in selenium_standalone.logs
+        assert "Skipping unknown package" not in selenium_standalone.logs
 
         # check that all ressources were loaded from the active server
         txt = fh_main.read()
@@ -34,10 +34,19 @@ def test_load_from_url(selenium_standalone, web_server_secondary, active_server)
         # no additional ressources were loaded from the other server
         assert len(fh_backup.read()) == 0
 
-    selenium_standalone.run("from pyparsing import Word, alphas")
-    selenium_standalone.run("Word(alphas).parseString('hello')")
+    selenium_standalone.run(
+        """
+        from pyparsing import Word, alphas
+        repr(Word(alphas).parseString('hello'))
+        """
+    )
 
     selenium_standalone.load_package(f"http://{url}:{port}/pytz.js")
+    selenium_standalone.run("import pytz")
+
+
+def test_load_relative_url(selenium_standalone):
+    selenium_standalone.load_package("./pytz.js")
     selenium_standalone.run("import pytz")
 
 
@@ -60,16 +69,16 @@ def test_uri_mismatch(selenium_standalone):
     assert (
         "URI mismatch, attempting to load package pyparsing" in selenium_standalone.logs
     )
-    assert "Invalid package name or URI" not in selenium_standalone.logs
 
 
 def test_invalid_package_name(selenium):
     selenium.load_package("wrong name+$")
-    assert "Invalid package name or URI" in selenium.logs
+    assert "Skipping unknown package" in selenium.logs
+
     selenium.clean_logs()
 
     selenium.load_package("tcp://some_url")
-    assert "Invalid package name or URI" in selenium.logs
+    assert "Skipping unknown package" in selenium.logs
 
 
 @pytest.mark.parametrize(
@@ -93,7 +102,7 @@ def test_load_packages_multiple(selenium_standalone, packages):
 def test_load_packages_sequential(selenium_standalone, packages):
     selenium = selenium_standalone
     promises = ",".join('pyodide.loadPackage("{}")'.format(x) for x in packages)
-    selenium.run_js_async("return Promise.all([{}])".format(promises))
+    selenium.run_js("return Promise.all([{}])".format(promises))
     selenium.run(f"import {packages[0]}")
     selenium.run(f"import {packages[1]}")
     # The log must show that each package is loaded exactly once,
@@ -110,10 +119,8 @@ def test_load_handle_failure(selenium_standalone):
     selenium.load_package("pytz2")
     selenium.load_package("pyparsing")
     assert "Loading pytz" in selenium.logs
-    assert "Loading pytz2" in selenium.logs
-    assert "Unknown package 'pytz2'" in selenium.logs
-    assert "Couldn't load package from URL" in selenium.logs
-    assert "Loading pyparsing" in selenium.logs  # <- this fails
+    assert "Skipping unknown package 'pytz2'" in selenium.logs
+    assert "Loading pyparsing" in selenium.logs
 
 
 def test_load_failure_retry(selenium_standalone):
@@ -146,4 +153,44 @@ def test_load_package_unknown(selenium_standalone):
 
     assert selenium_standalone.run_js(
         "return window.pyodide.loadedPackages.hasOwnProperty('pyparsing-custom')"
+    )
+
+
+def test_load_twice(selenium_standalone):
+    selenium_standalone.load_package("pytz")
+    selenium_standalone.load_package("pytz")
+    assert "pytz already loaded from default channel" in selenium_standalone.logs
+
+
+def test_load_twice_different_source(selenium_standalone):
+    selenium_standalone.load_package(["https://foo/pytz.js", "https://bar/pytz.js"])
+    assert (
+        "Loading same package pytz from https://bar/pytz.js and https://foo/pytz.js"
+        in selenium_standalone.logs
+    )
+
+
+def test_load_twice_same_source(selenium_standalone):
+    selenium_standalone.load_package(["https://foo/pytz.js", "https://foo/pytz.js"])
+    assert "Loading same package pytz" not in selenium_standalone.logs
+
+
+def test_js_load_package_from_python(selenium_standalone):
+    selenium = selenium_standalone
+    to_load = "pyparsing"
+    selenium.run(f"import js ; js.pyodide.loadPackage(['{to_load}'])")
+    assert f"Loading {to_load}" in selenium.logs
+    assert selenium.run_js("return Object.keys(pyodide.loadedPackages)") == [to_load]
+
+
+@pytest.mark.parametrize("jinja2", ["jinja2", "Jinja2"])
+def test_load_package_mixed_case(selenium_standalone, jinja2):
+    selenium = selenium_standalone
+    selenium.run_js(
+        f"""
+        await pyodide.loadPackage("{jinja2}");
+        pyodide.runPython(`
+            import jinja2
+        `)
+        """
     )
